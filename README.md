@@ -39,6 +39,11 @@ backstop for when you forget, not a charge controller.
 | Scooter | Gotrax XR Ultra — 36 V 7 Ah (252 Wh), charger 42 V 2 A |
 | Host | Raspberry Pi (`192.168.2.21`) with a TP-Link USB BT dongle; the onboard radio is disabled via `dtoverlay=disable-bt` |
 
+The skey is the plug's own pairing key, published here in the same spirit as the
+sibling repo: it only authorises a device that is already in BLE range, and
+without it nobody can repair one of these plugs once Govee's servers go away.
+No GitHub tokens, Wi-Fi credentials or other host secrets are in this repo.
+
 Charging from empty: 7 Ah ÷ 2 A = 3.5 h constant-current, plus the CV taper —
 about **4–5 h** in practice.
 
@@ -134,6 +139,9 @@ on `…2b10`. `response=True` fails with `WRITE_NOT_PERMITTED`.
 Derived from the decompiled Govee H5080 Android module
 (`TurnOnOffDelayController`, `BleConstants`) and confirmed live against plug
 E245 — including that `33 B0` accepts up to 1440 minutes.
+
+Full write-up, including the two measurement experiments the safety argument
+rests on, is in [`docs/PROTOCOL.md`](docs/PROTOCOL.md).
 
 ## Sibling project
 
