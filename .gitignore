@@ -1,4 +1,27 @@
+# Python
+*.py[cod]
 __pycache__/
-*.pyc
-target/
+*.so
+
+# Virtual Environment
+venv/
+.venv/
+
+# Secrets
+*.secret
+
+# Logs
+*.log
+nohup.out
+
+# Rust artifacts
+**/target/
+**/*.rs.bk
+**/*.rlib
+**/*.rmeta
+
+# BLE capture data
 .govee_hci.log
+
+# Personal agent config
+.pi/
