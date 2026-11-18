@@ -143,6 +143,21 @@ E245 — including that `33 B0` accepts up to 1440 minutes.
 Full write-up, including the two measurement experiments the safety argument
 rests on, is in [`docs/PROTOCOL.md`](docs/PROTOCOL.md).
 
+## Known rough edges
+
+The single radio is shared, and the plug's link teardown does not always settle
+instantly. What that looks like in practice:
+
+- The periodic poll occasionally logs `info retry 1/3:
+  le-connection-abort-by-local` and then succeeds. Since the single-session
+  rework, every action has still completed on the first attempt — zero failed
+  commands — while the poll quietly retries roughly once an hour.
+- `bluetoothd` may log `Device … is already connected` if a previous client died
+  mid-session. That is the stale link `ensure_free` now clears.
+- The humidity daemon shares this adapter and its H5179 sensor sits at a
+  marginal -72…-86 dBm, so it fails one read in roughly nine. That is a radio
+  range problem, not a charger problem, and it recovers on its next cycle.
+
 ## Sibling project
 
 [`govee-humidity-control`](https://github.com/AutoMas0n/govee-humidity-control)
