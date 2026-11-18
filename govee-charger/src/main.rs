@@ -19,6 +19,18 @@
 // therefore a HUMAN INPUT, not a measurement: the rider reads the scooter's
 // 4-bar display and picks a preset. Presets are deliberately generous ceilings
 // around a 4-5 h full charge, not precise estimates.
+//
+// THE CONNECTION BUG (found live 2026-11-18, fixed below). Every BLE failure in
+// this project's history has one cause: a link to the plug that is still
+// tearing down, or wedged, when the next connect starts. BlueZ then refuses
+// with `le-connection-abort-by-local`, bluetoothd logs "Device ... is already
+// connected", and the command burns all three retries. Seen live: the first
+// click after the daemon started failed 3/3 (02:42:43-02:42:47) and only the
+// next click succeeded. The plug stays in BlueZ's cache when a client dies
+// mid-session, so a stale link can outlive the process that made it.
+// Fixed two ways: `ensure_free` clears a stale link before connecting, and the
+// periodic poll no longer runs while a charge is armed (fewer connects = fewer
+// chances to leave one behind).
 
 use aes::cipher::{generic_array::GenericArray, BlockDecrypt, BlockEncrypt, KeyInit};
 use aes::Aes128;
@@ -261,16 +273,38 @@ async fn wait_frame(s: &mut NotifStream, sk: &[u8; 16], cmd: u8, sub: u8, secs: 
     None
 }
 
+/// Refuse to start a session on top of a link that is still up.
+///
+/// This is the fix for the symptom described at the top of this file. A connect
+/// attempted while the previous link is tearing down draws
+/// `le-connection-abort-by-local`; a link left behind by a client that died may
+/// never tear down at all. Check first, wait briefly, then disconnect
+/// explicitly rather than spending all three retries on a doomed connect.
+async fn ensure_free(per: &btleplug::platform::Peripheral) -> Result<(), String> {
+    if !per.is_connected().await.unwrap_or(false) {
+        return Ok(());
+    }
+    log::warn!("plug still connected - clearing the stale link before reconnecting");
+    per.disconnect().await.ok();
+    for _ in 0..20 {
+        if !per.is_connected().await.unwrap_or(false) {
+            return Ok(());
+        }
+        sleep(Duration::from_millis(250)).await;
+    }
+    Err("stale link: plug stuck connected, cannot get a clean session".into())
+}
+
 async fn try_plug_inner<T, Fut>(
     c: &btleplug::platform::Adapter,
-    plug_mac: &str,
     skey: Option<&[u8; 8]>,
     action: impl FnOnce(btleplug::platform::Peripheral, [u8; 16]) -> Fut,
 ) -> Result<T, String>
 where
     Fut: Future<Output = Result<T, String>>,
 {
-    let per = find_mac(c, plug_mac, 10).await?;
+    let per = find_mac(c, PLUG_MAC, 10).await?;
+    ensure_free(&per).await?;
     tokio::time::timeout(Duration::from_secs(12), per.connect())
         .await
         .map_err(|_| "conn: timeout")?
@@ -324,31 +358,10 @@ where
 
 // ========================= PLUG OPS =========================
 
-// Toggle: 33 01 11 = ON, 33 01 10 = OFF (note: same sub-command, payload differs).
-async fn plug_set(
-    c: &btleplug::platform::Adapter,
-    on: bool,
-    skey: Option<&[u8; 8]>,
-) -> Result<(), String> {
-    with_retry(if on { "on" } else { "off" }, || {
-        let c = c.clone();
-        async move {
-            try_plug_inner(&c, PLUG_MAC, skey, |per, sk| {
-                Box::pin(async move {
-                    let r = write_ctrl(
-                        &per,
-                        &encrypt(&frame_from(0x33, 0x01, &[if on { 0x11 } else { 0x10 }]), &sk),
-                    )
-                    .await;
-                    close(&per).await;
-                    r
-                })
-            })
-            .await
-        }
-    })
-    .await
-}
+// Each operation below is a SINGLE session on purpose. The plug's link teardown
+// does not settle instantly, so every extra connect is a chance to draw
+// `le-connection-abort-by-local` on the next one. One session per user action
+// keeps the critical path to a single teardown window.
 
 // One session, both reads. Two separate connections back-to-back reliably
 // draw `conn: le-connection-abort-by-local` on the second connect (the plug's
@@ -361,7 +374,7 @@ async fn plug_info(
     with_retry("info", || {
         let c = c.clone();
         async move {
-            try_plug_inner(&c, PLUG_MAC, skey, |per, sk| {
+            try_plug_inner(&c, skey, |per, sk| {
                 Box::pin(async move {
                     let mut s: NotifStream =
                         per.notifications().await.map_err(|e| format!("notif: {e}"))?;
@@ -388,24 +401,56 @@ async fn plug_info(
     .await
 }
 
-// Arm the ON-DEVICE auto-off: 33 B0 [index, delayType, mins/60, mins%60]
+// The ON-DEVICE auto-off is armed with 33 B0 [index, delayType, mins/60, mins%60],
 // index 0, delayType 0 = auto-OFF. Proven live to accept up to 1440 min and to
-// survive a power cut.
-async fn plug_arm(
+// survive a power cut. It is written inside plug_charge/plug_stop so that the
+// relay, the deadline and the readback share one session.
+
+/// ON + arm + verify in a SINGLE session.
+///
+/// This used to be three separate sessions (plug_set, plug_arm, plug_info), and
+/// each pair of consecutive connects risked `le-connection-abort-by-local`
+/// because the plug's link teardown had not settled. One session removes two
+/// teardown windows from the critical path, and the verify read happens on the
+/// same link that armed the timer, which is the strongest evidence available
+/// that the deadline was actually accepted.
+///
+/// Returns (plug_on, minutes_armed, seconds_left) as read back from the plug.
+async fn plug_charge(
     c: &btleplug::platform::Adapter,
     mins: u32,
     skey: Option<&[u8; 8]>,
-) -> Result<(), String> {
+) -> Result<(bool, u32, i32), String> {
     let mins = mins.min(HARD_CAP_MINS);
-    with_retry("arm", || {
+    with_retry("charge", || {
         let c = c.clone();
         async move {
-            try_plug_inner(&c, PLUG_MAC, skey, |per, sk| {
+            try_plug_inner(&c, skey, |per, sk| {
                 Box::pin(async move {
+                    let mut s: NotifStream =
+                        per.notifications().await.map_err(|e| format!("notif: {e}"))?;
+                    // Order: settle the relay first, then arm. See cmd_charge.
+                    write_ctrl(&per, &encrypt(&frame_from(0x33, 0x01, &[0x11]), &sk)).await?;
+                    sleep(Duration::from_millis(500)).await;
                     let payload = [0u8, 0u8, (mins / 60) as u8, (mins % 60) as u8];
-                    let r = write_ctrl(&per, &encrypt(&frame_from(0x33, 0xB0, &payload), &sk)).await;
+                    write_ctrl(&per, &encrypt(&frame_from(0x33, 0xB0, &payload), &sk)).await?;
+                    // Give the plug a moment to commit the deadline before
+                    // asking it to read the timer back.
+                    sleep(Duration::from_millis(800)).await;
+                    write_ctrl(&per, &encrypt(&frame_from(0xAA, 0x01, &[]), &sk)).await?;
+                    let st = wait_frame(&mut s, &sk, 0xAA, 0x01, 2).await;
+                    write_ctrl(&per, &encrypt(&frame_from(0xAA, 0xB0, &[0x00, 0x00]), &sk)).await?;
+                    let dl = wait_frame(&mut s, &sk, 0xAA, 0xB0, 2).await;
                     close(&per).await;
-                    r
+                    let on = st.ok_or("no state response")?[2] == 1;
+                    match dl {
+                        Some(f) => {
+                            let m = (f[4] as u32) * 60 + f[5] as u32;
+                            let left = i32::from_be_bytes([0, f[6], f[7], f[8]]);
+                            Ok((on, m, left))
+                        }
+                        None => Ok((on, 0, 0)),
+                    }
                 })
             })
             .await
@@ -414,9 +459,37 @@ async fn plug_arm(
     .await
 }
 
-// Clear the timer (arm 0 minutes).
-async fn plug_disarm(c: &btleplug::platform::Adapter, skey: Option<&[u8; 8]>) -> Result<(), String> {
-    plug_arm(c, 0, skey).await
+/// Clear the timer AND switch off in a single session, then verify OFF.
+///
+/// Order matters: the timer is cleared first so that nothing is left pending if
+/// the second write is the one that fails. Doing it in one session means a
+/// failed `stop` is a plain failure rather than a half-applied one.
+async fn plug_stop(c: &btleplug::platform::Adapter, skey: Option<&[u8; 8]>) -> Result<(), String> {
+    with_retry("stop", || {
+        let c = c.clone();
+        async move {
+            try_plug_inner(&c, skey, |per, sk| {
+                Box::pin(async move {
+                    let mut s: NotifStream =
+                        per.notifications().await.map_err(|e| format!("notif: {e}"))?;
+                    write_ctrl(&per, &encrypt(&frame_from(0x33, 0xB0, &[0, 0, 0, 0]), &sk)).await?;
+                    sleep(Duration::from_millis(400)).await;
+                    write_ctrl(&per, &encrypt(&frame_from(0x33, 0x01, &[0x10]), &sk)).await?;
+                    sleep(Duration::from_millis(600)).await;
+                    write_ctrl(&per, &encrypt(&frame_from(0xAA, 0x01, &[]), &sk)).await?;
+                    let st = wait_frame(&mut s, &sk, 0xAA, 0x01, 2).await;
+                    close(&per).await;
+                    if st.ok_or("no state response")?[2] == 1 {
+                        Err("verify: plug still ON after stop".into())
+                    } else {
+                        Ok(())
+                    }
+                })
+            })
+            .await
+        }
+    })
+    .await
 }
 
 // ========================= COMMANDS =========================
@@ -427,26 +500,21 @@ async fn plug_disarm(c: &btleplug::platform::Adapter, skey: Option<&[u8; 8]>) ->
 /// told — never leave the plug ON with no timer silently.
 async fn cmd_charge(c: &btleplug::platform::Adapter, mins: u32, skey: Option<&[u8; 8]>) -> Result<u32, String> {
     let mins = mins.clamp(1, HARD_CAP_MINS);
-    plug_set(c, true, skey).await?;
-    plug_arm(c, mins, skey).await?;
-    // Verify: a plug left ON with no timer is the failure this project exists
-    // to prevent, so confirm the timer actually took.
-    match plug_info(c, skey).await {
-        Ok((on, m, left)) if left > 0 && on => {
-            log::info!("charge: armed {m}m (left {left}s)");
-            Ok(mins)
-        }
-        Ok((false, _, _)) => Err("verify: plug did not turn ON".into()),
-        Ok((_, m, left)) => Err(format!("armed but timer reads {m}m/{left}s — NOT protected")),
-        Err(e) => Err(format!("armed, verify failed: {e}")),
+    // One session: ON, arm, read back. A plug left ON with no timer is the
+    // failure this project exists to prevent, so the readback decides success.
+    let (on, m, left) = plug_charge(c, mins, skey).await?;
+    if !on {
+        return Err("verify: plug did not turn ON".into());
     }
+    if left <= 0 {
+        return Err(format!("plug is ON but timer reads {m}m/{left}s — NOT protected, run stop"));
+    }
+    log::info!("charge: armed {m}m (left {left}s)");
+    Ok(mins)
 }
 
 async fn cmd_stop(c: &btleplug::platform::Adapter, skey: Option<&[u8; 8]>) -> Result<(), String> {
-    // Clear the timer BEFORE cutting power, so nothing is pending afterwards.
-    plug_disarm(c, skey).await?;
-    plug_set(c, false, skey).await?;
-    Ok(())
+    plug_stop(c, skey).await
 }
 
 // ========================= STATUS =========================
@@ -646,7 +714,19 @@ async fn serve(c: &btleplug::platform::Adapter, port: u16, skey: Option<&[u8; 8]
         let sk = skey.copied();
         tokio::spawn(async move {
             loop {
-                refresh(&c, &sh, sk.as_ref()).await;
+                // Skip the poll while a charge is armed. The page counts the
+                // deadline down locally, so nothing on screen needs this, and
+                // every connect we avoid is one fewer chance of leaving a link
+                // behind for the next command to trip over (see the connection
+                // bug at the top of this file). The one hit we do take is the
+                // first pass, which populates the display after a restart.
+                let busy = {
+                    let st = sh.st.lock().await;
+                    st.plug == Some(true) && st.left_sec.unwrap_or(0) > 0
+                };
+                if !busy {
+                    refresh(&c, &sh, sk.as_ref()).await;
+                }
                 sleep(Duration::from_secs(180)).await;
             }
         });
