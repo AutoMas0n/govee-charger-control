@@ -523,6 +523,11 @@ struct Status {
     plug: Option<bool>,
     armed_mins: Option<u32>,
     left_sec: Option<i32>,
+    /// Wall-clock deadline of the armed timer, computed once when the arm is
+    /// verified. `left_sec` is DERIVED from this on every read rather than
+    /// being a stored countdown, because nothing decrements it: the process
+    /// only learns that time passed when it next talks to the plug.
+    deadline: Option<u64>,
     mode: String,
     last_cmd: Option<String>,
     last_error: Option<String>,
@@ -530,20 +535,36 @@ struct Status {
 }
 
 impl Status {
+    /// Seconds remaining, recomputed from the deadline. Returns None when no
+    /// deadline is set, and 0 once it has passed — which is what lets the
+    /// poll-skip below decide to resume on its own.
+    fn left_now(&self) -> i32 {
+        match self.deadline {
+            Some(d) => {
+                let now = now_epoch();
+                if now >= d { 0 } else { (d - now) as i32 }
+            }
+            None => 0,
+        }
+    }
+}
+
+impl Status {
     fn json(&self) -> String {
         fn o<T: std::fmt::Display>(v: Option<T>) -> String {
             v.map(|x| x.to_string()).unwrap_or_else(|| "null".into())
         }
+        let left = self.left_now();
         format!(
-            r#"{{"plug":{},"armed":{},"armed_min":{},"left_sec":{},"mode":"{}","last_cmd":{},"last_error":{},"last_ok_ts":{},"cap_min":{}}}"#,
+            r#"{{"plug":{},"armed":{},"armed_min":{},"left_sec":{},"mode":"{}","last_cmd":{},"last_error":{},"last_ok_ts":{},"cap_min":{}}}"#, 
             match self.plug {
                 Some(true) => "\"ON\"".to_string(),
                 Some(false) => "\"OFF\"".to_string(),
                 None => "null".into(),
             },
-            self.left_sec.map(|l| l > 0).unwrap_or(false),
+            left > 0,
             o(self.armed_mins),
-            o(self.left_sec),
+            left,
             self.mode,
             self.last_cmd
                 .as_ref()
@@ -579,6 +600,14 @@ async fn refresh(c: &btleplug::platform::Adapter, sh: &Arc<Shared>, skey: Option
             st.plug = Some(on);
             st.armed_mins = if left > 0 { Some(m) } else { None };
             st.left_sec = Some(left);
+            // The plug's own countdown is authoritative; anchor the deadline
+            // to it so the displayed value is right immediately and then
+            // derives forward without another connect.
+            st.deadline = if left > 0 {
+                Some(now_epoch() + left as u64)
+            } else {
+                None
+            };
             st.last_ok_ts = now_epoch();
             st.last_error = None;
         }
@@ -720,14 +749,30 @@ async fn serve(c: &btleplug::platform::Adapter, port: u16, skey: Option<&[u8; 8]
                 // behind for the next command to trip over (see the connection
                 // bug at the top of this file). The one hit we do take is the
                 // first pass, which populates the display after a restart.
+                // `left_now` recomputes from the deadline, so this flips back
+                // to false by itself once the timer expires. Gating this on a
+                // stored `left_sec` value would deadlock the poll: only a
+                // refresh could ever lower it, and the skip is what stops the
+                // refresh from running. (That bug shipped for one restart.)
                 let busy = {
                     let st = sh.st.lock().await;
-                    st.plug == Some(true) && st.left_sec.unwrap_or(0) > 0
+                    st.plug == Some(true) && st.left_now() > 0
                 };
                 if !busy {
                     refresh(&c, &sh, sk.as_ref()).await;
                 }
-                sleep(Duration::from_secs(180)).await;
+                // While a charge is armed, poll more often near the deadline
+                // so the dashboard notices the self-stop promptly instead of
+                // showing a phantom charge for up to three minutes.
+                let wait = {
+                    let st = sh.st.lock().await;
+                    if st.plug == Some(true) {
+                        st.left_now().clamp(0, 60) as u64
+                    } else {
+                        180
+                    }
+                };
+                sleep(Duration::from_secs(wait.max(20))).await;
             }
         });
     }
@@ -805,6 +850,7 @@ async fn serve(c: &btleplug::platform::Adapter, port: u16, skey: Option<&[u8; 8]
                                     st.plug = Some(true);
                                     st.armed_mins = Some(armed);
                                     st.left_sec = Some((armed * 60) as i32);
+                                    st.deadline = Some(now_epoch() + (armed as u64) * 60);
                                     st.last_ok_ts = now_epoch();
                                 }
                             }
@@ -829,6 +875,7 @@ async fn serve(c: &btleplug::platform::Adapter, port: u16, skey: Option<&[u8; 8]
                             st.plug = Some(false);
                             st.armed_mins = None;
                             st.left_sec = Some(0);
+                            st.deadline = None;
                             st.last_ok_ts = now_epoch();
                         }
                     }
