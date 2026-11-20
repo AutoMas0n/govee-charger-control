@@ -137,15 +137,53 @@ async fn adapter() -> btleplug::platform::Adapter {
     m.adapters().await.unwrap().into_iter().next().unwrap()
 }
 
+/// Look the device up in BlueZ's own device cache, no discovery involved.
+///
+/// `peripherals()` maps to GetManagedObjects, which is a plain property read.
+/// It does NOT need the adapter's single discovery session the way
+/// `start_scan` does — and that distinction is the whole bug documented at the
+/// top of this file.
+async fn cached_mac(
+    c: &btleplug::platform::Adapter,
+    mac: &str,
+) -> Result<Option<btleplug::platform::Peripheral>, String> {
+    for p in c.peripherals().await.map_err(|e| format!("periphs: {e}"))? {
+        if p.address().to_string().to_uppercase() == mac {
+            return Ok(Some(p));
+        }
+    }
+    Ok(None)
+}
+
 async fn find_mac(
     c: &btleplug::platform::Adapter,
     mac: &str,
     secs: u64,
 ) -> Result<btleplug::platform::Peripheral, String> {
     let mac = mac.to_uppercase();
-    c.start_scan(ScanFilter::default())
-        .await
-        .map_err(|e| format!("scan: {e}"))?;
+    // Cache FIRST. BlueZ already remembers every device it has seen, and both
+    // this daemon and the humidity daemon drive discovery on this one shared
+    // adapter. BlueZ allows a single discovery session: whoever asks second
+    // gets `org.bluez.Error.InProgress` ("Operation already in progress"), and
+    // that is exactly what deadlocked both dashboards at the 06:01 boot.
+    if let Some(p) = cached_mac(c, &mac).await? {
+        return Ok(p);
+    }
+    match c.start_scan(ScanFilter::default()).await {
+        Ok(()) => {}
+        Err(e) => {
+            // Someone else owns discovery. Rather than fail, wait for their
+            // scan to populate the cache and take it from there.
+            log::warn!("scan unavailable ({e}) - waiting for the other daemon's discovery");
+            for _ in 0..(secs * 4) {
+                sleep(Duration::from_millis(250)).await;
+                if let Some(p) = cached_mac(c, &mac).await? {
+                    return Ok(p);
+                }
+            }
+            return Err(format!("scan: {e}"));
+        }
+    }
     let d = tokio::time::Instant::now() + Duration::from_secs(secs);
     loop {
         for p in c.peripherals().await.map_err(|e| format!("periphs: {e}"))? {
