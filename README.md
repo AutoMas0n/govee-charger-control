@@ -149,9 +149,9 @@ The single radio is shared, and the plug's link teardown does not always settle
 instantly. What that looks like in practice:
 
 - The periodic poll occasionally logs `info retry 1/3:
-  le-connection-abort-by-local` and then succeeds. Since the single-session
-  rework, every action has still completed on the first attempt — zero failed
-  commands — while the poll quietly retries roughly once an hour.
+  le-connection-abort-by-local` and then succeeds. It is the link teardown
+  racing the next connect, not discovery: find_mac no longer scans, so it can
+  no longer hit `Operation already in progress`. Every command completes.
 - `bluetoothd` may log `Device … is already connected` if a previous client died
   mid-session. That is the stale link `ensure_free` now clears.
 - The humidity daemon shares this adapter and its H5179 sensor sits at a
